@@ -86,6 +86,78 @@ function formatSlipMessage(l: Launch, v: Verdict, facts: LaunchFacts): string {
   );
 }
 
+// ----- daily summary ----------------------------------------------------
+
+type LaunchResult = {
+  launch: Launch;
+  facts: LaunchFacts;
+  verdict: Verdict;
+};
+
+function formatDailySummary(results: LaunchResult[], totalFetched: number): string {
+  const today = new Date().toLocaleDateString("en-US", {
+    timeZone: "America/New_York",
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+
+  const visibleNight = results.filter(
+    (r) =>
+      r.facts.sunAltitudeAtVbDeg < 0 &&
+      r.verdict.visible &&
+      (MIN_CONFIDENCE_FOR_NOTIFY as Set<string>).has(r.verdict.confidence),
+  );
+
+  const nightNotVisible = results.filter(
+    (r) =>
+      r.facts.sunAltitudeAtVbDeg < 0 &&
+      !(r.verdict.visible && (MIN_CONFIDENCE_FOR_NOTIFY as Set<string>).has(r.verdict.confidence)),
+  );
+
+  const daytime = results.filter((r) => r.facts.sunAltitudeAtVbDeg >= 0);
+
+  const lines: string[] = [
+    `SpaceX Watch — ${today}`,
+    "",
+    `${totalFetched} launch${totalFetched !== 1 ? "es" : ""} in the next ${LOOKAHEAD_DAYS} days`,
+  ];
+
+  if (visibleNight.length > 0) {
+    for (const r of visibleNight) {
+      const sky = r.facts.vbForecast
+        ? `${r.facts.vbForecast}${r.facts.vbPrecipitationProbability !== null ? `, precip ${r.facts.vbPrecipitationProbability}%` : ""}`
+        : "forecast unavailable";
+      lines.push(
+        "",
+        `VISIBLE FROM VB: ${r.launch.name}`,
+        `${netLocalLabel(r.launch.net)} — ${r.facts.locationName}`,
+        `Look ${r.facts.bearingVbToPadCompass} (${r.facts.bearingVbToPadDeg.toFixed(0)}°) | Sky: ${sky}`,
+        `Confidence: ${r.verdict.confidence}`,
+      );
+      if (r.verdict.viewing_tip) lines.push(r.verdict.viewing_tip);
+    }
+  } else {
+    lines.push("", "No launches visible from VB this week.");
+  }
+
+  if (nightNotVisible.length > 0) {
+    lines.push("", `Other night launches (${nightNotVisible.length}):`);
+    for (const r of nightNotVisible) {
+      lines.push(`  ${r.launch.name} | ${netLocalLabel(r.launch.net)}`);
+    }
+  }
+
+  if (daytime.length > 0) {
+    lines.push("", `Daytime launches (${daytime.length}):`);
+    for (const r of daytime) {
+      lines.push(`  ${r.launch.name} | ${netLocalLabel(r.launch.net)}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 // ----- per-launch processing -------------------------------------------
 
 async function buildFacts(l: Launch): Promise<LaunchFacts> {
@@ -129,15 +201,13 @@ type Action =
   | { kind: "scrub" }
   | { kind: "new_candidate"; verdict: Verdict; facts: LaunchFacts }
   | { kind: "no_longer_visible"; verdict: Verdict }
-  | { kind: "time_slip"; verdict: Verdict; facts: LaunchFacts }
-  | { kind: "daily_reminder"; verdict: Verdict; facts: LaunchFacts };
+  | { kind: "time_slip"; verdict: Verdict; facts: LaunchFacts };
 
 function decide(
   l: Launch,
   v: Verdict,
   facts: LaunchFacts,
   prior: LaunchState | undefined,
-  todayEt: string,
 ): Action {
   // 1. Scrub takes priority over visibility judgment.
   if (l.status === "Hold" || l.status === "Failure" || l.status === "Partial Failure") {
@@ -168,11 +238,7 @@ function decide(
     return { kind: "time_slip", verdict: v, facts };
   }
 
-  // Daily-reminder cadence: at most one per ET calendar day.
-  if (prior.lastNotifiedDay !== todayEt) {
-    return { kind: "daily_reminder", verdict: v, facts };
-  }
-
+  // Already notified about this visible launch — daily summary covers reminders.
   return { kind: "none" };
 }
 
@@ -193,11 +259,6 @@ async function actOn(action: Action, l: Launch): Promise<{ messaged: boolean; ve
       return { messaged: true, verdict: action.verdict };
     case "time_slip":
       await sendImessage(formatSlipMessage(l, action.verdict, action.facts));
-      return { messaged: true, verdict: action.verdict };
-    case "daily_reminder":
-      await sendImessage(
-        formatVisibleMessage(`Reminder: launch tonight — ${l.name}`, l, action.verdict, action.facts),
-      );
       return { messaged: true, verdict: action.verdict };
   }
 }
@@ -253,23 +314,26 @@ export const handler = async (): Promise<RunSummary> => {
   let messaged = 0;
   let errors = 0;
 
+  const results: LaunchResult[] = [];
+
   for (const l of launches) {
     try {
       const facts = await buildFacts(l);
       const verdict = await judge(facts);
       judged += 1;
+      results.push({ launch: l, facts, verdict });
       console.log(
         `${l.id} ${l.name}: visible=${verdict.visible} conf=${verdict.confidence} reason="${verdict.reason}"`,
       );
 
-      const prior = state[l.id];
-      const action = decide(l, verdict, facts, prior, todayEt);
-      const { messaged: didMessage } = await actOn(action, l);
+      const prior = state.launches[l.id];
+      const action = decide(l, verdict, facts, prior);
+      const { messaged: didMessage, verdict: actionVerdict } = await actOn(action, l);
       if (didMessage) messaged += 1;
 
-      state[l.id] = nextStateFor(
+      state.launches[l.id] = nextStateFor(
         l,
-        verdict,
+        actionVerdict ?? verdict,
         facts.vbForecast,
         prior,
         todayEt,
@@ -280,6 +344,17 @@ export const handler = async (): Promise<RunSummary> => {
       console.error(`Failed to process ${l.id} (${l.name}):`, err);
       // Don't update state on failure — next run will retry cleanly.
     }
+  }
+
+  // Send one daily summary covering all upcoming launches. The per-launch
+  // event-driven alerts above handle scrubs, time slips, and new candidates;
+  // this single message is the daily "here's the full picture" digest.
+  if (state.summaryLastDay !== todayEt) {
+    const summary = formatDailySummary(results, launches.length);
+    await sendImessage(summary);
+    state.summaryLastDay = todayEt;
+    messaged += 1;
+    console.log("Sent daily summary");
   }
 
   await saveState(state);

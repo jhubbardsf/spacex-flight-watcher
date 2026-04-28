@@ -25,7 +25,10 @@ export type LaunchState = {
   firstSeenAt: string;
 };
 
-export type WatchState = Record<string, LaunchState>;
+export type WatchState = {
+  launches: Record<string, LaunchState>;
+  summaryLastDay: string; // YYYY-MM-DD in ET — ensures one daily summary per day
+};
 
 async function getJson<T>(key: string): Promise<T | null> {
   try {
@@ -53,7 +56,13 @@ async function putJson(key: string, value: unknown): Promise<void> {
 }
 
 export async function loadState(): Promise<WatchState> {
-  return (await getJson<WatchState>(KEY)) ?? {};
+  const raw = await getJson<unknown>(KEY);
+  if (!raw || typeof raw !== "object") return { launches: {}, summaryLastDay: "" };
+  // Migrate from legacy flat Record<string, LaunchState> format (no "launches" key).
+  if (!("launches" in raw)) {
+    return { launches: raw as Record<string, LaunchState>, summaryLastDay: "" };
+  }
+  return raw as WatchState;
 }
 
 export async function saveState(state: WatchState): Promise<void> {
@@ -61,11 +70,11 @@ export async function saveState(state: WatchState): Promise<void> {
   // a launch ID stops appearing in LL2 results without our state machine
   // ever marking it scrubbed (e.g. mission renamed, launch removed).
   const cutoff = Date.now() - RETAIN_MS;
-  const pruned: WatchState = {};
-  for (const [id, entry] of Object.entries(state)) {
+  const pruned: Record<string, LaunchState> = {};
+  for (const [id, entry] of Object.entries(state.launches)) {
     if (new Date(entry.firstSeenAt).getTime() >= cutoff) pruned[id] = entry;
   }
-  await putJson(KEY, pruned);
+  await putJson(KEY, { launches: pruned, summaryLastDay: state.summaryLastDay });
 }
 
 export function todayInEt(): string {
