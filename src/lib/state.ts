@@ -21,11 +21,14 @@ export type LaunchState = {
   lastConfidence: "low" | "medium" | "high" | null;
   lastForecast: string | null; // last seen weather summary (cloud check)
   lastNotifiedAt: string; // ISO of most recent iMessage about this launch
-  lastNotifiedDay: string; // YYYY-MM-DD in ET — throttles "every morning" reminder
+  lastNotifiedDay: string; // YYYY-MM-DD in ET — records when we last messaged
   firstSeenAt: string;
 };
 
-export type WatchState = Record<string, LaunchState>;
+export type WatchState = {
+  launches: Record<string, LaunchState>;
+  lastSummaryDay?: string; // YYYY-MM-DD in ET — throttles daily digest to once per day
+};
 
 async function getJson<T>(key: string): Promise<T | null> {
   try {
@@ -53,7 +56,14 @@ async function putJson(key: string, value: unknown): Promise<void> {
 }
 
 export async function loadState(): Promise<WatchState> {
-  return (await getJson<WatchState>(KEY)) ?? {};
+  const raw = await getJson<WatchState | Record<string, LaunchState>>(KEY);
+  if (!raw) return { launches: {} };
+  // Backward compat: old state was a flat Record<id, LaunchState> with no
+  // `launches` wrapper. LL2 IDs are UUIDs so the key "launches" can't collide.
+  if (!("launches" in raw)) {
+    return { launches: raw as Record<string, LaunchState> };
+  }
+  return raw as WatchState;
 }
 
 export async function saveState(state: WatchState): Promise<void> {
@@ -61,9 +71,12 @@ export async function saveState(state: WatchState): Promise<void> {
   // a launch ID stops appearing in LL2 results without our state machine
   // ever marking it scrubbed (e.g. mission renamed, launch removed).
   const cutoff = Date.now() - RETAIN_MS;
-  const pruned: WatchState = {};
-  for (const [id, entry] of Object.entries(state)) {
-    if (new Date(entry.firstSeenAt).getTime() >= cutoff) pruned[id] = entry;
+  const pruned: WatchState = {
+    lastSummaryDay: state.lastSummaryDay,
+    launches: {},
+  };
+  for (const [id, entry] of Object.entries(state.launches)) {
+    if (new Date(entry.firstSeenAt).getTime() >= cutoff) pruned.launches[id] = entry;
   }
   await putJson(KEY, pruned);
 }
